@@ -1,4 +1,5 @@
 import argparse
+import copy
 import cloudscraper
 import logging
 import os
@@ -10,6 +11,8 @@ import stat
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
+from collections import Counter
 
 from bs4 import BeautifulSoup, Tag
 from cloudscraper.exceptions import CloudflareChallengeError, CloudflareCaptchaError
@@ -689,8 +692,207 @@ class TermiusAPKModifier:
             safe_rmtree(out_dir)
         run_command(['java', '-jar', apk_editor_jar, 'd', '-i', apk_file, '-o', out_dir])
 
+    @staticmethod
+    def _xml_parser():
+        """Create an XML parser that retains comments from Android resources."""
+        return ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+
+    @staticmethod
+    def _resource_key(element):
+        return element.attrib.get("name")
+
+    @staticmethod
+    def _resource_text(element):
+        """Return text content used when checking Android format placeholders."""
+        return "".join(element.itertext())
+
+    @staticmethod
+    def _format_placeholders(element):
+        """Return Android printf-style placeholders contained in a resource."""
+        text = TermiusAPKModifier._resource_text(element)
+        # %% is a literal percent sign, not a formatting argument.
+        pattern = r"%(?!(?:%))(?:[1-9][0-9]*\$)?[a-zA-Z]"
+        return Counter(re.findall(pattern, text))
+
+    @staticmethod
+    def _copy_resource_content(source, target):
+        """Copy translated XML content while retaining target attributes."""
+        target.text = source.text
+        target[:] = [copy.deepcopy(child) for child in source]
+
+    def _merge_plural_or_array(self, source, target, resource_name):
+        """Merge matching plural quantities or array item positions."""
+        if source.tag == "plurals":
+            source_children = {
+                child.attrib.get("quantity"): child
+                for child in source
+                if child.tag == "item"
+            }
+            target_children = {
+                child.attrib.get("quantity"): child
+                for child in target
+                if child.tag == "item"
+            }
+            child_key = "quantity"
+        else:
+            source_children = {
+                index: child
+                for index, child in enumerate(source)
+                if child.tag == "item"
+            }
+            target_children = {
+                index: child
+                for index, child in enumerate(target)
+                if child.tag == "item"
+            }
+            child_key = "index"
+
+        matched = 0
+        for key, target_child in target_children.items():
+            source_child = source_children.get(key)
+            if source_child is None:
+                continue
+            if self._format_placeholders(source_child) != self._format_placeholders(target_child):
+                logger.warning(
+                    "Skipping translation with incompatible format placeholders: "
+                    f"{resource_name} ({child_key}={key})"
+                )
+                continue
+            self._copy_resource_content(source_child, target_child)
+            matched += 1
+        return matched
+
+    def _merge_translation_xml(self, source_xml, target_xml):
+        """Merge only resources present in both source and target XML files."""
+        try:
+            source_tree = ET.parse(source_xml, parser=self._xml_parser())
+            target_tree = ET.parse(target_xml, parser=self._xml_parser())
+        except ET.ParseError as exc:
+            raise Exception(f"Invalid Android resource XML: {exc}") from exc
+
+        source_root = source_tree.getroot()
+        target_root = target_tree.getroot()
+        supported_tags = {"string", "plurals", "string-array"}
+
+        source_resources = {
+            (element.tag, self._resource_key(element)): element
+            for element in source_root
+            if element.tag in supported_tags and self._resource_key(element)
+        }
+        target_resources = {
+            (element.tag, self._resource_key(element)): element
+            for element in target_root
+            if element.tag in supported_tags and self._resource_key(element)
+        }
+
+        source_names = {
+            self._resource_key(element)
+            for element in source_root
+            if element.tag in supported_tags and self._resource_key(element)
+        }
+        target_names = {
+            self._resource_key(element)
+            for element in target_root
+            if element.tag in supported_tags and self._resource_key(element)
+        }
+
+        matched = 0
+        format_incompatible = 0
+        type_incompatible = 0
+        for (resource_type, resource_name), source in source_resources.items():
+            target = target_resources.get((resource_type, resource_name))
+            if target is None:
+                other_type = next(
+                    (
+                        target_element
+                        for (target_type, target_name), target_element
+                        in target_resources.items()
+                        if target_name == resource_name
+                    ),
+                    None,
+                )
+                if other_type is not None:
+                    type_incompatible += 1
+                    logger.warning(
+                        "Skipping translation because resource types differ: "
+                        f"{resource_name} ({resource_type} vs {other_type.tag})"
+                    )
+                continue
+
+            if resource_type == "string":
+                if self._format_placeholders(source) != self._format_placeholders(target):
+                    format_incompatible += 1
+                    logger.warning(
+                        "Skipping translation with incompatible format placeholders: "
+                        f"{resource_name}"
+                    )
+                    continue
+                self._copy_resource_content(source, target)
+                matched += 1
+            else:
+                merged_children = self._merge_plural_or_array(
+                    source, target, resource_name
+                )
+                if merged_children:
+                    matched += 1
+                else:
+                    format_incompatible += 1
+                    logger.warning(
+                        "Skipping translation because no compatible child entries "
+                        f"were found: {resource_name}"
+                    )
+
+        source_only = len(source_names - target_names)
+        target_only = len(target_names - source_names)
+        if source_only:
+            logger.warning(
+                f"Translation source contains {source_only} resource(s) absent from target; skipped"
+            )
+        if target_only:
+            logger.info(
+                f"Target contains {target_only} resource(s) absent from translation source; retained"
+            )
+        if type_incompatible:
+            logger.warning(
+                f"Resource type incompatible: {type_incompatible}"
+            )
+        if format_incompatible:
+            logger.warning(
+                f"Format-incompatible translation skipped: {format_incompatible}"
+            )
+
+        if matched == 0:
+            raise Exception(
+                "No compatible translations matched the target Android resource XML"
+            )
+
+        # Keep the standard Android resource namespace prefixes stable when present.
+        ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+        ET.register_namespace("tools", "http://schemas.android.com/tools")
+        ET.register_namespace("xliff", "urn:oasis:names:tc:xliff:document:1.2")
+        temporary_xml = f"{target_xml}.tmp"
+        try:
+            target_tree.write(temporary_xml, encoding="utf-8", xml_declaration=True)
+            os.replace(temporary_xml, target_xml)
+        finally:
+            if os.path.exists(temporary_xml):
+                os.remove(temporary_xml)
+        logger.info(
+            "Translation merge complete: "
+            f"translation matched: {matched}, "
+            f"source-only skipped: {source_only}, "
+            f"target-only retained: {target_only}"
+        )
+        return {
+            "matched": matched,
+            "source_only_skipped": source_only,
+            "target_only_retained": target_only,
+            "format_incompatible": format_incompatible,
+            "type_incompatible": type_incompatible,
+        }
+
     def _replace_language_xml(self, target_dir):
-        """Replace the localized strings resource found in the decoded APK."""
+        """Merge repository translations into the decoded APK's resources."""
         src_xml = os.path.join(self.working_dir, LANGUAGE_XML)
         if not os.path.exists(src_xml):
             raise Exception(f"Language source file not found: {src_xml}")
@@ -716,9 +918,11 @@ class TermiusAPKModifier:
                 f"{target_xml}"
             )
 
-        logger.info(f"Replacing language file: Source={src_xml}, Target={target_xml}")
-        if not replace_file(src_xml, target_xml):
-            raise Exception(f"Failed to replace language file: {target_xml}")
+        logger.info(
+            "Merging translations by resource name: "
+            f"Source={src_xml}, Target={target_xml}"
+        )
+        self._merge_translation_xml(src_xml, target_xml)
 
     def _verify_final_apk(self, apk_file, expected_metadata):
         """Run final APK metadata and signature verification."""
