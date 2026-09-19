@@ -23,10 +23,11 @@ from logger import setup_logging
 
 # ------------------------------ Parameters Configuration ------------------------------
 APP_FILE = "Termius"
+TERMIUS_PACKAGE = "com.server.auditor.ssh.client"
 DIR_TMP = ".tmp_dir"
-EXT_APKM = ".apkm"
 EXT_APK = ".apk"
-APKM_FILENAME = f"{APP_FILE}{EXT_APKM}"
+MERGED_APK_FILENAME = f"{APP_FILE}{EXT_APK}"
+GOOGLE_PLAY_DOWNLOAD_DIR = "google-play-download"
 APK_EDITOR_FILENAME = "APKEditor.jar"
 LANGUAGE_XML = "strings.xml"
 BASE_URL = "https://www.apkmirror.com"
@@ -431,40 +432,133 @@ class TermiusAPKModifier:
         except Exception as e:
             logger.error(f"Error downloading {filename}: {str(e)}")
 
-    def _download_termius_apk(self, filename=APKM_FILENAME):
-        """Download Termius.apk"""
-        file_path = os.path.join(self.working_dir, filename)
-        if os.path.exists(file_path):
-            logger.info(f"{filename} already exists, skipping download")
-            return
+    def _google_play_credentials(self):
+        """Load Google Play credentials from the process environment."""
+        email = os.environ.get("GOOGLE_PLAY_EMAIL", "").strip()
+        aas_token = os.environ.get("GOOGLE_PLAY_AAS_TOKEN", "").strip()
+        if not email:
+            raise Exception("GOOGLE_PLAY_EMAIL is not configured")
+        if not aas_token:
+            raise Exception("GOOGLE_PLAY_AAS_TOKEN is not configured")
+        return email, aas_token
 
+    def _download_google_play_apk(self):
+        """Download the latest Google Play split APK set with apkeep."""
+        email, aas_token = self._google_play_credentials()
+        download_dir = os.path.join(self.working_dir, GOOGLE_PLAY_DOWNLOAD_DIR)
+        create_or_recreate_dir(download_dir)
+
+        logger.info(
+            "Downloading latest Termius from Google Play with apkeep "
+            f"(package={TERMIUS_PACKAGE}, split_apk=true)"
+        )
+        run_command([
+            "apkeep",
+            "-a", TERMIUS_PACKAGE,
+            "-d", "google-play",
+            "-e", email,
+            "-t", aas_token,
+            "-o", "split_apk=true,locale=en_US,timezone=UTC",
+            download_dir,
+        ], log=False)
+
+        apk_files = sorted(Path(download_dir).rglob("*.apk"))
+        if not apk_files:
+            raise Exception(
+                f"apkeep completed but no APK files were found in {download_dir}"
+            )
+
+        base_apk_name = f"{TERMIUS_PACKAGE}.apk"
+        base_apks = [path for path in apk_files if path.name == base_apk_name]
+        if not base_apks:
+            raise Exception(
+                "Google Play download does not contain the expected base APK "
+                f"({base_apk_name}); found: "
+                + ", ".join(path.name for path in apk_files)
+            )
+
+        input_path = base_apks[0].parent
+        logger.info(
+            f"Google Play APK input directory: {input_path} "
+            f"({len(list(input_path.glob('*.apk')))} APK files)"
+        )
+        return input_path
+
+    def _download_and_merge_google_play_apk(self):
+        """Download Google Play split APKs and merge them into one APK."""
+        input_path = self._download_google_play_apk()
+        merged_apk = os.path.join(self.tmp_dir, MERGED_APK_FILENAME)
+        self._merge_apk_input(input_path, merged_apk)
+        metadata = self._extract_apk_metadata(merged_apk)
+        self._validate_apk_metadata(metadata)
+        logger.info(
+            "Google Play APK merged successfully: "
+            f"versionName={metadata['version_name']}, "
+            f"versionCode={metadata['version_code']}"
+        )
+        return merged_apk, metadata
+
+    def _extract_apk_metadata(self, apk_file):
+        """Read package/version metadata from an APK using aapt."""
+        if not os.path.exists(apk_file):
+            raise Exception(f"APK file does not exist: {apk_file}")
+
+        logger.info(f"Executing: aapt dump badging {apk_file}")
         try:
-            logger.info(f"{filename} does not exist, starting download...")
-            logger.info(f"Fetching version number for {filename}...")
+            result = subprocess.run(
+                ["aapt", "dump", "badging", apk_file],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise Exception(
+                "aapt was not found; install Android SDK build-tools"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            raise Exception(
+                f"aapt dump badging failed for {apk_file}: {output.strip()}"
+            ) from exc
 
-            latest_version = self.extract_version()
-            if not latest_version:
-                raise Exception("Failed to extract version number, terminating program.")
+        output = result.stdout
+        logger.info(output.strip())
+        match = re.search(
+            r"package: name='([^']+)' versionCode='([^']+)' "
+            r"versionName='([^']+)'",
+            output,
+        )
+        if not match:
+            raise Exception(
+                f"Unable to parse package metadata from aapt output for {apk_file}"
+            )
 
-            version_replace = latest_version.replace('.', '-')
-            version_slug = f"termius-modern-ssh-client-{version_replace}"
+        package_name, version_code, version_name = match.groups()
+        return {
+            "package_name": package_name,
+            "version_code": version_code,
+            "version_name": version_name,
+        }
 
-            _, apk_download_page_url = self._build_apkmirror_download_chain(BASE_APK_URL, version_slug, GLOBAL_HEADERS)
+    def _validate_apk_metadata(self, metadata):
+        """Validate that the downloaded APK is the expected Termius package."""
+        if metadata["package_name"] != TERMIUS_PACKAGE:
+            raise Exception(
+                "Unexpected APK package name: "
+                f"{metadata['package_name']} (expected {TERMIUS_PACKAGE})"
+            )
+        if not metadata["version_name"] or not metadata["version_code"]:
+            raise Exception("APK metadata is missing versionName or versionCode")
 
-            if not apk_download_page_url:
-                raise Exception("Failed to build valid download link, terminating program.")
-
-            direct_download_url = self._get_final_download_url(apk_download_page_url)
-            if not direct_download_url:
-                raise Exception("Failed to obtain final download link, terminating program.")
-
-            logger.info(f"Obtained final download link: {direct_download_url}")
-            logger.info(f"Starting download {filename}...")
-            if not self.scraper.download(direct_download_url, file_path):
-                raise Exception(f"{filename} download failed.")
-            logger.info(f"{filename} download completed")
-        except Exception as e:
-            raise Exception(f"Error occurred while downloading {filename}: {str(e)}")
+    def _write_github_output(self, metadata, source):
+        """Publish build metadata for GitHub Actions."""
+        output_file = os.environ.get("GITHUB_OUTPUT")
+        if not output_file:
+            return
+        with open(output_file, "a", encoding="utf-8") as output:
+            output.write(f"version_name={metadata['version_name']}\n")
+            output.write(f"version_code={metadata['version_code']}\n")
+            output.write(f"source={source}\n")
 
     def _load_sign_properties(self):
         """Load signing configuration"""
@@ -574,14 +668,17 @@ class TermiusAPKModifier:
         os.remove(build_apk_file)
         shutil.move(str(build_apk_signed_file), str(build_apk_file))
 
-    def _apkm_to_apk(self, apkm_file, apk_file):
-        """Convert APKM to APK"""
+    def _merge_apk_input(self, input_path, apk_file):
+        """Merge a directory or archive of split APKs into one APK."""
         apk_editor_jar = os.path.join(self.working_dir, APK_EDITOR_FILENAME)
         if not os.path.exists(apk_editor_jar):
             raise Exception(f"{apk_editor_jar} not found.")
         if os.path.exists(apk_file):
             os.remove(apk_file)
-        run_command(['java', '-jar', apk_editor_jar, 'm', '-i', apkm_file, '-o', apk_file])
+        run_command([
+            "java", "-jar", apk_editor_jar,
+            "m", "-i", str(input_path), "-o", apk_file,
+        ])
 
     def _decode_apk(self, apk_file, out_dir):
         """Decompile APK file"""
@@ -593,13 +690,58 @@ class TermiusAPKModifier:
         run_command(['java', '-jar', apk_editor_jar, 'd', '-i', apk_file, '-o', out_dir])
 
     def _replace_language_xml(self, target_dir):
-        """Replace language resource file"""
-        if not os.path.exists(self.working_dir):
-            raise Exception(f"Failed to replace {LANGUAGE_XML}, source file not found: {self.working_dir}")
+        """Replace the localized strings resource found in the decoded APK."""
         src_xml = os.path.join(self.working_dir, LANGUAGE_XML)
-        tar_xml = os.path.join(target_dir, 'resources', 'package_1', 'res', 'values-zh-rCN', LANGUAGE_XML)
-        logger.info(f"Replacing language file: Source={src_xml}, Target={tar_xml}")
-        replace_file(src_xml, tar_xml)
+        if not os.path.exists(src_xml):
+            raise Exception(f"Language source file not found: {src_xml}")
+
+        candidates = sorted(
+            Path(target_dir).glob(
+                "resources/*/res/values-zh-rCN/strings.xml"
+            )
+        )
+        if not candidates:
+            raise Exception(
+                "Target Chinese strings.xml was not found under the decoded APK "
+                "(resources/*/res/values-zh-rCN/strings.xml)"
+            )
+
+        package_1_candidates = [
+            path for path in candidates if path.parts[-4] == "package_1"
+        ]
+        target_xml = package_1_candidates[0] if package_1_candidates else candidates[0]
+        if len(candidates) > 1:
+            logger.warning(
+                "Found multiple Chinese strings.xml files; using "
+                f"{target_xml}"
+            )
+
+        logger.info(f"Replacing language file: Source={src_xml}, Target={target_xml}")
+        if not replace_file(src_xml, target_xml):
+            raise Exception(f"Failed to replace language file: {target_xml}")
+
+    def _verify_final_apk(self, apk_file, expected_metadata):
+        """Run final APK metadata and signature verification."""
+        logger.info("Final APK metadata (aapt dump badging):")
+        metadata = self._extract_apk_metadata(apk_file)
+        self._validate_apk_metadata(metadata)
+        if (
+            metadata["version_name"] != expected_metadata["version_name"]
+            or metadata["version_code"] != expected_metadata["version_code"]
+        ):
+            raise Exception(
+                "Final APK version changed unexpectedly: "
+                f"{metadata['version_name']} ({metadata['version_code']}) vs "
+                f"{expected_metadata['version_name']} "
+                f"({expected_metadata['version_code']})"
+            )
+        logger.info(
+            f"package={metadata['package_name']} "
+            f"versionName={metadata['version_name']} "
+            f"versionCode={metadata['version_code']}"
+        )
+        logger.info("Final APK signature verification (apksigner verify --verbose):")
+        run_command([get_apksigner_shell(), "verify", "--verbose", apk_file])
 
     def _build_apk(self, out_dir, apk_filename):
         """Repackage APK file"""
@@ -625,7 +767,7 @@ class TermiusAPKModifier:
         shutil.move(str(apk_file), str(export_apk_file))
 
     def _check_required_files(self):
-        """Check if required files exist"""
+        """Check signing/localization inputs and acquire the Google Play APK."""
         if not self.sign_properties:
             raise Exception("Signing configuration file not found.")
 
@@ -633,34 +775,31 @@ class TermiusAPKModifier:
         if not os.path.exists(language_xml):
             raise Exception("Language xml not found.")
 
-        termius_apk = os.path.join(self.working_dir, APKM_FILENAME)
-        if not os.path.exists(termius_apk):
-            self._download_termius_apk(APKM_FILENAME)
-
         apk_editor_jar = os.path.join(self.working_dir, APK_EDITOR_FILENAME)
         if not os.path.exists(apk_editor_jar):
             self._download_apk_editor_jar(APK_EDITOR_FILENAME)
 
-        sign_keystore = os.path.join(self.keystore_dir, self.sign_properties["sign.keystore"])
+        sign_keystore = os.path.join(
+            self.keystore_dir,
+            self.sign_properties["sign.keystore"],
+        )
         if not os.path.exists(sign_keystore):
             self._generate_keystore(self.sign_properties)
 
+        return self._download_and_merge_google_play_apk()
+
     def modify_apk(self):
-        """Main method to modify APK file"""
+        """Download, localize, repackage, align, and sign the APK."""
         try:
             logger.info("Starting APK file processing")
-            self._check_required_files()
+            merged_apk, metadata = self._check_required_files()
+            source = "google-play"
 
             decompile_dir = os.path.join(self.tmp_dir, APP_FILE)
-            apkm_file = os.path.join(self.working_dir, APP_FILE + EXT_APKM)
-            apk_file = os.path.join(self.tmp_dir, APP_FILE + EXT_APK)
             filename_zh = APP_FILE + ZH_SUFFIX
 
-            logger.info("Converting APKM to APK")
-            self._apkm_to_apk(apkm_file, apk_file)
-
-            logger.info("Decompiling APK file")
-            self._decode_apk(apk_file, decompile_dir)
+            logger.info("Decompiling merged Google Play APK")
+            self._decode_apk(merged_apk, decompile_dir)
 
             logger.info("Replacing language resources")
             self._replace_language_xml(decompile_dir)
@@ -676,11 +815,20 @@ class TermiusAPKModifier:
 
             logger.info("Exporting final APK file")
             self._export_apk(filename_zh, APP_FILE)
+            final_apk = os.path.join(self.working_dir, "out", APP_FILE + EXT_APK)
+
+            self._verify_final_apk(final_apk, metadata)
+            self._write_github_output(metadata, source)
 
             logger.info(f"Cleaning temporary directory: {self.tmp_dir}")
             safe_rmtree(self.tmp_dir)
 
-            logger.info("APK modification completed")
+            logger.info(
+                "APK modification completed: "
+                f"source={source}, version_name={metadata['version_name']}, "
+                f"version_code={metadata['version_code']}"
+            )
+            return metadata
 
         except Exception as e:
             logger.error(f"Process terminated abnormally: {e}")
@@ -712,16 +860,8 @@ def main():
 
     modifier = TermiusAPKModifier()
     if args.version:
-        try:
-            version = modifier.extract_version()
-            if version:
-                print(version)
-            else:
-                print("0.0.0")
-                sys.exit(1)
-        except Exception as e:
-            print(f"Error: {e}")
-            sys.exit(1)
+        logger.error("--version is no longer a network-free operation; run the full build instead.")
+        sys.exit(2)
 
     if not args.localize and not args.version:
         logger.info("No parameters specified, will execute default localization operation")
