@@ -19,13 +19,16 @@ jobs:
           python-version: '3.12'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android build tools
         shell: bash
         run: |
           set -euo pipefail
           sdkmanager --install "platform-tools" "build-tools;35.0.0"
+          export PATH="${ANDROID_HOME}/build-tools/35.0.0:$PATH"
           echo "${ANDROID_HOME}/build-tools/35.0.0" >> "$GITHUB_PATH"
           aapt version
           zipalign 2>&1 | head -n 1 || true
