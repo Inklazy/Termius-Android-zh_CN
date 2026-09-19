@@ -41,6 +41,7 @@ APK_SIGN_PROPERTIES = "apk.sign.properties"
 ALIGNED_SUFFIX = "_aligned"
 SIGNED_SUFFIX = "_signed"
 ZH_SUFFIX = "_zh"
+TERMIUS_TRANSLATION_SENTINELS = ("connect", "add_host", "all_hosts")
 
 # ------------------------------ Log Configuration ------------------------------
 setup_logging(log_level='INFO')
@@ -762,108 +763,115 @@ class TermiusAPKModifier:
             matched += 1
         return matched
 
-    def _merge_translation_xml(self, source_xml, target_xml):
-        """Merge only resources present in both source and target XML files."""
+    def _merge_translation_xml(self, source_xml, default_xml, target_xml):
+        """Merge translations using the default resource table as authority."""
         try:
             source_tree = ET.parse(source_xml, parser=self._xml_parser())
+            default_tree = ET.parse(default_xml, parser=self._xml_parser())
             target_tree = ET.parse(target_xml, parser=self._xml_parser())
         except ET.ParseError as exc:
             raise Exception(f"Invalid Android resource XML: {exc}") from exc
 
         source_root = source_tree.getroot()
+        default_root = default_tree.getroot()
         target_root = target_tree.getroot()
         supported_tags = {"string", "plurals", "string-array"}
 
-        source_resources = {
-            (element.tag, self._resource_key(element)): element
-            for element in source_root
-            if element.tag in supported_tags and self._resource_key(element)
-        }
-        target_resources = {
-            (element.tag, self._resource_key(element)): element
-            for element in target_root
-            if element.tag in supported_tags and self._resource_key(element)
-        }
+        def resource_map(root):
+            return {
+                (element.tag, self._resource_key(element)): element
+                for element in root
+                if element.tag in supported_tags and self._resource_key(element)
+            }
 
+        source_resources = resource_map(source_root)
+        default_resources = resource_map(default_root)
+        target_resources = resource_map(target_root)
         source_names = {
-            self._resource_key(element)
-            for element in source_root
-            if element.tag in supported_tags and self._resource_key(element)
+            name for (_, name) in source_resources
         }
-        target_names = {
-            self._resource_key(element)
-            for element in target_root
-            if element.tag in supported_tags and self._resource_key(element)
+        default_names = {
+            name for (_, name) in default_resources
         }
 
-        matched = 0
+        translated_existing = 0
+        translated_new = 0
+        obsolete_skipped = 0
         format_incompatible = 0
         type_incompatible = 0
+        translated_names = set()
+
         for (resource_type, resource_name), source in source_resources.items():
-            target = target_resources.get((resource_type, resource_name))
-            if target is None:
-                other_type = next(
+            default = default_resources.get((resource_type, resource_name))
+            if default is None:
+                default_same_name = next(
                     (
-                        target_element
-                        for (target_type, target_name), target_element
-                        in target_resources.items()
-                        if target_name == resource_name
+                        (default_type, default_element)
+                        for (default_type, default_name), default_element
+                        in default_resources.items()
+                        if default_name == resource_name
                     ),
                     None,
                 )
-                if other_type is not None:
+                if default_same_name is None:
+                    obsolete_skipped += 1
+                    logger.warning(
+                        "Skipping obsolete translation absent from default resources: "
+                        f"{resource_name}"
+                    )
+                else:
                     type_incompatible += 1
                     logger.warning(
-                        "Skipping translation because resource types differ: "
-                        f"{resource_name} ({resource_type} vs {other_type.tag})"
+                        "Skipping translation because resource types differ from "
+                        f"default resources: {resource_name} "
+                        f"({resource_type} vs {default_same_name[0]})"
                     )
                 continue
 
-            if resource_type == "string":
-                if self._format_placeholders(source) != self._format_placeholders(target):
-                    format_incompatible += 1
-                    logger.warning(
-                        "Skipping translation with incompatible format placeholders: "
-                        f"{resource_name}"
-                    )
-                    continue
-                self._copy_resource_content(source, target)
-                matched += 1
-            else:
-                merged_children = self._merge_plural_or_array(
-                    source, target, resource_name
+            if self._format_placeholders(source) != self._format_placeholders(default):
+                format_incompatible += 1
+                logger.warning(
+                    "Skipping translation with incompatible format placeholders "
+                    f"against default English resource: {resource_name}"
                 )
-                if merged_children:
-                    matched += 1
-                else:
-                    format_incompatible += 1
-                    logger.warning(
-                        "Skipping translation because no compatible child entries "
-                        f"were found: {resource_name}"
-                    )
+                continue
 
-        source_only = len(source_names - target_names)
-        target_only = len(target_names - source_names)
-        if source_only:
+            target = target_resources.get((resource_type, resource_name))
+            if target is not None:
+                self._copy_resource_content(source, target)
+                translated_existing += 1
+            else:
+                # The default resource is the validity authority. Add the
+                # translated resource to the existing zh-CN document without
+                # removing any resources shipped by the APK.
+                target = copy.deepcopy(source)
+                target_root.append(target)
+                target_resources[(resource_type, resource_name)] = target
+                translated_new += 1
+            translated_names.add(resource_name)
+
+        untranslated_new = len(default_names - source_names)
+        if obsolete_skipped:
             logger.warning(
-                f"Translation source contains {source_only} resource(s) absent from target; skipped"
+                f"obsolete translations skipped: {obsolete_skipped}"
             )
-        if target_only:
+        if untranslated_new:
             logger.info(
-                f"Target contains {target_only} resource(s) absent from translation source; retained"
+                "untranslated new resources retained via fallback: "
+                f"{untranslated_new}"
             )
         if type_incompatible:
             logger.warning(
-                f"Resource type incompatible: {type_incompatible}"
+                f"Resource type incompatible with default resources: {type_incompatible}"
             )
         if format_incompatible:
             logger.warning(
                 f"Format-incompatible translation skipped: {format_incompatible}"
             )
 
-        if matched == 0:
+        if not translated_names:
             raise Exception(
-                "No compatible translations matched the target Android resource XML"
+                "No compatible translations matched the default Android resources"
             )
 
         # Keep the standard Android resource namespace prefixes stable when present.
@@ -877,52 +885,131 @@ class TermiusAPKModifier:
         finally:
             if os.path.exists(temporary_xml):
                 os.remove(temporary_xml)
+
+        self._validate_termius_translations(
+            default_xml,
+            target_xml,
+            translated_names,
+        )
         logger.info(
             "Translation merge complete: "
-            f"translation matched: {matched}, "
-            f"source-only skipped: {source_only}, "
-            f"target-only retained: {target_only}"
+            f"translated existing zh-CN: {translated_existing}, "
+            f"translated newly added zh-CN: {translated_new}, "
+            f"obsolete translations skipped: {obsolete_skipped}, "
+            f"untranslated new resources retained via fallback: {untranslated_new}"
         )
         return {
-            "matched": matched,
-            "source_only_skipped": source_only,
-            "target_only_retained": target_only,
+            "translated_existing": translated_existing,
+            "translated_new": translated_new,
+            "obsolete_skipped": obsolete_skipped,
+            "untranslated_new": untranslated_new,
             "format_incompatible": format_incompatible,
             "type_incompatible": type_incompatible,
         }
 
+    def _validate_termius_translations(
+        self, default_xml, target_xml, translated_names
+    ):
+        """Ensure core Termius UI resources were actually localized."""
+        try:
+            default_root = ET.parse(
+                default_xml, parser=self._xml_parser()
+            ).getroot()
+            target_root = ET.parse(
+                target_xml, parser=self._xml_parser()
+            ).getroot()
+        except ET.ParseError as exc:
+            raise Exception(f"Invalid XML during localization validation: {exc}") from exc
+
+        default_strings = {
+            self._resource_key(element): element
+            for element in default_root
+            if element.tag == "string" and self._resource_key(element)
+        }
+        target_strings = {
+            self._resource_key(element): element
+            for element in target_root
+            if element.tag == "string" and self._resource_key(element)
+        }
+        default_missing = []
+        missing = []
+        unchanged = []
+        for resource_name in TERMIUS_TRANSLATION_SENTINELS:
+            default = default_strings.get(resource_name)
+            target = target_strings.get(resource_name)
+            if default is None:
+                default_missing.append(resource_name)
+                logger.warning(
+                    f"Termius validation resource is absent from default APK: {resource_name}"
+                )
+                continue
+            if target is None or resource_name not in translated_names:
+                missing.append(resource_name)
+                continue
+            target_text = self._resource_text(target).strip()
+            default_text = self._resource_text(default).strip()
+            if not target_text or target_text == default_text:
+                unchanged.append(resource_name)
+
+        if default_missing or missing or unchanged:
+            raise Exception(
+                "Termius-specific localization validation failed: "
+                f"default_missing={default_missing}, "
+                f"missing={missing}, unchanged={unchanged}"
+            )
+        logger.info(
+            "Termius-specific localization validation passed: "
+            + ", ".join(TERMIUS_TRANSLATION_SENTINELS)
+        )
+
     def _replace_language_xml(self, target_dir):
-        """Merge repository translations into the decoded APK's resources."""
+        """Merge repository translations into decoded APK resources."""
         src_xml = os.path.join(self.working_dir, LANGUAGE_XML)
         if not os.path.exists(src_xml):
             raise Exception(f"Language source file not found: {src_xml}")
 
-        candidates = sorted(
+        zh_candidates = sorted(
             Path(target_dir).glob(
                 "resources/*/res/values-zh-rCN/strings.xml"
             )
         )
-        if not candidates:
+        if not zh_candidates:
             raise Exception(
                 "Target Chinese strings.xml was not found under the decoded APK "
                 "(resources/*/res/values-zh-rCN/strings.xml)"
             )
 
         package_1_candidates = [
-            path for path in candidates if path.parts[-4] == "package_1"
+            path for path in zh_candidates if path.parts[-4] == "package_1"
         ]
-        target_xml = package_1_candidates[0] if package_1_candidates else candidates[0]
-        if len(candidates) > 1:
+        target_xml = package_1_candidates[0] if package_1_candidates else zh_candidates[0]
+        resource_root = target_xml.parent.parent
+        default_xml = resource_root / "values" / "strings.xml"
+        if not default_xml.exists():
+            default_candidates = sorted(
+                Path(target_dir).glob(
+                    f"resources/{target_xml.parts[-4]}/res/values/strings.xml"
+                )
+            )
+            if default_candidates:
+                default_xml = default_candidates[0]
+        if not default_xml.exists():
+            raise Exception(
+                "Default values/strings.xml was not found for the selected APK resource package: "
+                f"{resource_root}"
+            )
+
+        if len(zh_candidates) > 1:
             logger.warning(
                 "Found multiple Chinese strings.xml files; using "
                 f"{target_xml}"
             )
 
         logger.info(
-            "Merging translations by resource name: "
-            f"Source={src_xml}, Target={target_xml}"
+            "Merging translations using default resources as authority: "
+            f"Source={src_xml}, Default={default_xml}, Target={target_xml}"
         )
-        self._merge_translation_xml(src_xml, target_xml)
+        self._merge_translation_xml(src_xml, str(default_xml), str(target_xml))
 
     def _verify_final_apk(self, apk_file, expected_metadata):
         """Run final APK metadata and signature verification."""
