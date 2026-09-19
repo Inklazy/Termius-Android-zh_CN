@@ -46,6 +46,7 @@ jobs:
             "https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-x86_64-unknown-linux-gnu"
           chmod +x "$RUNNER_TEMP/apkeep/apkeep"
           echo "$RUNNER_TEMP/apkeep" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/apkeep:$PATH"
           apkeep --version
 
       - name: Install Python dependencies
