@@ -57,14 +57,47 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/apkeep"
-          curl --fail --location --retry 3 \
-            -o "$RUNNER_TEMP/apkeep/apkeep" \
-            "https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-x86_64-unknown-linux-gnu"
-          chmod +x "$RUNNER_TEMP/apkeep/apkeep"
+          URL="https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-x86_64-unknown-linux-gnu"
+          TARGET="$RUNNER_TEMP/apkeep/apkeep"
+          downloaded=false
+          for attempt in 1 2 3 4 5; do
+            rm -f "$TARGET"
+            echo "Downloading apkeep ${APKEEP_VERSION} (attempt ${attempt}/5)..."
+            if curl \
+                --fail \
+                --location \
+                --retry 3 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --connect-timeout 20 \
+                --max-time 180 \
+                -o "$TARGET" \
+                "$URL"; then
+              downloaded=true
+              break
+            fi
+            rm -f "$TARGET"
+            if [ "$attempt" -eq 5 ]; then
+              echo "::error::Failed to download apkeep ${APKEEP_VERSION} after 5 attempts"
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
+
+          if [ "$downloaded" != true ] || [ ! -s "$TARGET" ]; then
+            echo "::error::Downloaded apkeep file is missing or empty: $TARGET"
+            exit 1
+          fi
+          chmod +x "$TARGET"
           echo "$RUNNER_TEMP/apkeep" >> "$GITHUB_PATH"
           export PATH="$RUNNER_TEMP/apkeep:$PATH"
+          APKEEP_VERSION_OUTPUT="$("$TARGET" --version)"
+          echo "$APKEEP_VERSION_OUTPUT"
+          if ! printf '%s\n' "$APKEEP_VERSION_OUTPUT" | grep -Eq "(^|[^0-9])${APKEEP_VERSION}([^0-9]|$)"; then
+            echo "::error::Downloaded apkeep version does not match ${APKEEP_VERSION}"
+            exit 1
+          fi
           apkeep --version
-
       - name: Install Python dependencies
         run: |
           cd android
