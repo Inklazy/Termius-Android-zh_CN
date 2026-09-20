@@ -1079,11 +1079,14 @@ class TermiusAPKModifier:
 
         return self._download_and_merge_google_play_apk()
 
-    def modify_apk(self):
+    def modify_apk(self, before_build=None):
         """Download, localize, repackage, align, and sign the APK."""
         try:
             logger.info("Starting APK file processing")
             merged_apk, metadata = self._check_required_files()
+            if before_build is not None and not before_build(metadata):
+                safe_rmtree(self.tmp_dir)
+                return None
             source = "google-play"
 
             decompile_dir = os.path.join(self.tmp_dir, APP_FILE)

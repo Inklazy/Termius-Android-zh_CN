@@ -4,9 +4,25 @@ on:
   schedule:
     - cron: '0 16 * * *'
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Rebuild current Google Play version (Artifact only, no Release)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize scheduled/manual runs, including publication, without canceling builds.
+concurrency:
+  group: android-google-play-release
+  cancel-in-progress: false
 
 jobs:
   localize:
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -58,6 +74,8 @@ jobs:
       - name: Build localized Google Play APK
         id: build
         env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_BUILD: ${{ inputs.force_build || false }}
           GOOGLE_PLAY_EMAIL: ${{ secrets.GOOGLE_PLAY_EMAIL }}
           GOOGLE_PLAY_AAS_TOKEN: ${{ secrets.GOOGLE_PLAY_AAS_TOKEN }}
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
@@ -82,10 +100,18 @@ jobs:
           fi
           printf '%s\n' "$APK_SIGN_PROPERTIES" > apk.sign.properties
 
-          python apktools.py
+          python release_android.py build
 
       - name: Upload Artifact
+        if: steps.build.outputs.built == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: Termius_v${{ steps.build.outputs.version_name }}
-          path: android/out/
+          path: android/out/${{ steps.build.outputs.asset }}
+          if-no-files-found: error
+
+      - name: Publish verified Android release
+        if: steps.build.outputs.built == 'true' && steps.build.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python android/release_android.py publish
