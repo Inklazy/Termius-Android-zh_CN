@@ -416,10 +416,16 @@ class TermiusAPKModifier:
             logger.info(f"{filename} already exists, skipping download")
             return
 
+        token = os.environ.get("GH_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("GH_TOKEN is required to download APKEditor from the GitHub API")
+
         try:
             logger.info(f"{filename} not found, starting download...")
             api_url = f"https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
-            response = self.scraper.get_json(api_url)
+            response = self.scraper.get_json(
+                api_url, headers={"Authorization": f"Bearer {token}"}
+            )
             assets = response.get('assets', [])
 
             if not assets:
@@ -433,8 +439,21 @@ class TermiusAPKModifier:
             if not self.scraper.download(download_url, file_path):
                 raise Exception(f"{filename} download failed.")
             logger.info(f"{filename} download completed, saved to: {file_path}")
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else "unknown"
+            if status == 403:
+                message = e.response.text.lower()
+                reason = ("GitHub API rate limit exceeded" if "rate limit" in message
+                          else "GitHub API access forbidden; check GH_TOKEN permissions")
+            elif status == 429:
+                reason = "GitHub API rate limit exceeded"
+            else:
+                reason = "GitHub API request failed"
+            raise RuntimeError(f"Failed to fetch APKEditor release: HTTP {status} ({reason})") from None
         except Exception as e:
-            logger.error(f"Error downloading {filename}: {str(e)}")
+            raise RuntimeError(
+                f"Error downloading {filename}: {str(e).replace(token, '[REDACTED]')}"
+            ) from None
 
     def _google_play_credentials(self):
         """Load Google Play credentials from the process environment."""
